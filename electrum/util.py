@@ -650,6 +650,30 @@ def is_non_negative_integer(val) -> bool:
     return False
 
 
+def is_integer(val) -> bool:
+    try:
+        int(val)
+    except:
+        return False
+    else:
+        return True
+
+
+def is_real_number(val, *, as_str: bool = False) -> bool:
+    if as_str:  # only accept str
+        if not isinstance(val, str):
+            return False
+    else:  # only accept int/float/etc.
+        if isinstance(val, str):
+            return False
+    try:
+        Decimal(val)
+    except:
+        return False
+    else:
+        return True
+
+
 def chunks(items, size: int):
     """Break up items, an iterable, into chunks of length size."""
     if size < 1:
@@ -793,7 +817,6 @@ def block_explorer_info():
     return mainnet_block_explorers if not constants.net.TESTNET else testnet_block_explorers
 
 def block_explorer(config: 'SimpleConfig') -> str:
-    from . import constants
     default_ = 'qtum.info'
     be_key = config.get('block_explorer', default_)
     be = block_explorer_info().get(be_key)

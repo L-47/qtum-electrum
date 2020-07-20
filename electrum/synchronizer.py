@@ -34,10 +34,10 @@ from aiorpcx import TaskGroup, run_in_thread, RPCError
 
 from . import util
 from .transaction import Transaction, PartialTransaction
-from .util import bh2u, make_aiohttp_session, NetworkJobOnDefaultServer, random_shuffled_copy, bfh
+from .util import make_aiohttp_session, NetworkJobOnDefaultServer, random_shuffled_copy, bfh
 from .bitcoin import (address_to_scripthash, is_address, b58_address_to_hash160, hash160_to_b58_address,
                       hash160_to_p2pkh, TOKEN_TRANSFER_TOPIC, Delegation, DELEGATION_CONTRACT,
-                      ADD_DELEGATION_TOPIC)
+                      ADD_DELEGATION_TOPIC, is_p2pkh_address)
 from .network import UntrustedServerReturnedError
 from .logging import Logger
 from .interface import GracefulDisconnect
@@ -58,7 +58,7 @@ def history_status(h):
     status = ''
     for tx_hash, height in h:
         status += tx_hash + ':%d:' % height
-    return bh2u(hashlib.sha256(status.encode('ascii')).digest())
+    return hashlib.sha256(status.encode('ascii')).digest().hex()
 
 
 def token_history_status(h):
@@ -66,7 +66,7 @@ def token_history_status(h):
         return None
     status = ':'.join(['{}:{:d}:{:d}'.format(tx_hash, height, log_index)
                        for tx_hash, height, log_index in h])
-    return bh2u(hashlib.sha256(status.encode('ascii')).digest())
+    return hashlib.sha256(status.encode('ascii')).digest().hex()
 
 
 class SynchronizerBase(NetworkJobOnDefaultServer):
@@ -158,10 +158,12 @@ class SynchronizerBase(NetworkJobOnDefaultServer):
             self.requested_addrs.remove(addr)
 
         async def subscribe_to_delegation(addr):
+            if not is_p2pkh_address(addr):
+                return
             self._delegation_requests_sent += 1
             try:
                 await self.session.subscribe('blockchain.contract.event.subscribe',
-                                             [bh2u(b58_address_to_hash160(addr)[1]), DELEGATION_CONTRACT,
+                                             [b58_address_to_hash160(addr)[1].hex(), DELEGATION_CONTRACT,
                                               ADD_DELEGATION_TOPIC],
                                              self.delegation_status_queue)
             except RPCError as e:
@@ -181,7 +183,7 @@ class SynchronizerBase(NetworkJobOnDefaultServer):
             self._token_requests_sent += 1
             try:
                 await self.session.subscribe('blockchain.contract.event.subscribe',
-                                             [bh2u(b58_address_to_hash160(bind_addr)[1]), contract_addr, TOKEN_TRANSFER_TOPIC],
+                                             [b58_address_to_hash160(bind_addr)[1].hex(), contract_addr, TOKEN_TRANSFER_TOPIC],
                                              self.token_status_queue)
             except RPCError as e:
                 if e.message == 'history too large':  # no unique error code
@@ -264,15 +266,12 @@ class Synchronizer(SynchronizerBase):
         self.requested_histories.add((addr, status))
         h = address_to_scripthash(addr)
         self._requests_sent += 1
-        result = await self.network.get_history_for_scripthash(h)
+        result = await self.interface.get_history_for_scripthash(h)
         self._requests_answered += 1
         self.logger.info(f"receiving history {addr} {len(result)}")
         hashes = set(map(lambda item: item['tx_hash'], result))
         hist = list(map(lambda item: (item['tx_hash'], item['height']), result))
         # tx_fees
-        for item in result:
-            if item['height'] in (-1, 0) and 'fee' not in item:
-                raise Exception("server response to get_history contains unconfirmed tx without fee")
         tx_fees = [(item['tx_hash'], item.get('fee')) for item in result]
         tx_fees = dict(filter(lambda x:x[1] is not None, tx_fees))
         # Check that txids are unique
@@ -386,7 +385,7 @@ class Synchronizer(SynchronizerBase):
     async def _get_transaction(self, tx_hash, *, allow_server_not_finding_tx=False):
         self._requests_sent += 1
         try:
-            raw_tx = await self.network.get_transaction(tx_hash)
+            raw_tx = await self.interface.get_transaction(tx_hash)
         except UntrustedServerReturnedError as e:
             # most likely, "No such mempool or blockchain transaction"
             if allow_server_not_finding_tx:

@@ -4,12 +4,10 @@
 """
 __author__ = 'CodeFace'
 """
-from PyQt5.QtCore import *
-from PyQt5.QtWidgets import *
-from PyQt5.QtGui import *
+from PyQt5.QtWidgets import QGridLayout, QLabel, QPushButton, QComboBox, QDialog, QLineEdit, QHBoxLayout, QWidget
 from .util import ButtonsLineEdit, Buttons, CancelButton, MessageBoxMixin
 from .amountedit import AmountEdit
-from electrum.bitcoin import is_b58_address, b58_address_to_hash160, bh2u, is_hash160, Token
+from electrum.bitcoin import is_b58_address, b58_address_to_hash160, is_hash160, Token
 from electrum import constants
 from electrum.i18n import _
 
@@ -260,7 +258,7 @@ class TokenSendLayout(QGridLayout):
         if is_b58_address(address_to):
             addr_type, hash160 = b58_address_to_hash160(address_to)
             if addr_type == constants.net.ADDRTYPE_P2PKH:
-                hash160 = bh2u(hash160)
+                hash160 = hash160.hex()
             else:
                 raise Exception(_('invalid address to send to'))
         elif is_hash160(address_to):

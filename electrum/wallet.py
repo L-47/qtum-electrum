@@ -54,7 +54,7 @@ from .util import (NotEnoughFunds, UserCancelled, profiler,
                    format_satoshis, format_fee_satoshis, NoDynamicFeeEstimates,
                    WalletFileException, BitcoinException, MultipleSpendMaxTxOutputs,
                    InvalidPassword, format_time, timestamp_to_datetime, Satoshis,
-                   Fiat, bfh, bh2u, TxMinedInfo, quantize_feerate, create_bip21_uri, OrderedDictWithIndex)
+                   Fiat, bfh, TxMinedInfo, quantize_feerate, create_bip21_uri, OrderedDictWithIndex)
 from .util import get_backup_dir
 from .simple_config import SimpleConfig
 from .bitcoin import (COIN, TYPE_ADDRESS, TYPE_PUBKEY, is_address, address_to_script, serialize_privkey,
@@ -68,7 +68,8 @@ from .storage import StorageEncryptionVersion, WalletStorage
 from .wallet_db import WalletDB
 from . import transaction, bitcoin, coinchooser, paymentrequest, ecc, bip32
 from .transaction import (Transaction, TxInput, UnknownTxinType, TxOutput,
-                          PartialTransaction, PartialTxInput, PartialTxOutput, TxOutpoint)
+                          PartialTransaction, PartialTxInput, PartialTxOutput, TxOutpoint,
+                          is_opsender_script, h160_from_opsender_script)
 from .plugin import run_hook
 from .address_synchronizer import (AddressSynchronizer, TX_HEIGHT_LOCAL,
                                    TX_HEIGHT_UNCONF_PARENT, TX_HEIGHT_UNCONFIRMED, TX_HEIGHT_FUTURE)
@@ -720,7 +721,7 @@ class Abstract_Wallet(AddressSynchronizer, ABC):
             amount_sat=amount,
             outputs=outputs,
             message=message,
-            id=bh2u(sha256(repr(outputs))[0:16]),
+            id=sha256(repr(outputs))[0:16].hex(),
             time=timestamp,
             exp=exp,
             bip70=None,
@@ -781,11 +782,13 @@ class Abstract_Wallet(AddressSynchronizer, ABC):
     def export_invoices(self, path):
         write_json_file(path, list(self.invoices.values()))
 
-    def _get_relevant_invoice_keys_for_tx(self, tx: Transaction) -> Set[str]:
+    def get_relevant_invoice_keys_for_tx(self, tx: Transaction) -> Set[str]:
         relevant_invoice_keys = set()
         for txout in tx.outputs():
             for invoice_key in self._invoices_from_scriptpubkey_map.get(txout.scriptpubkey, set()):
-                relevant_invoice_keys.add(invoice_key)
+                # note: the invoice might have been deleted since, so check now:
+                if invoice_key in self.invoices:
+                    relevant_invoice_keys.add(invoice_key)
         return relevant_invoice_keys
 
     def _prepare_onchain_invoice_paid_detection(self):
@@ -826,7 +829,7 @@ class Abstract_Wallet(AddressSynchronizer, ABC):
         tx_hash = tx.txid()
         with self.transaction_lock:
             labels = []
-            for invoice_key in self._get_relevant_invoice_keys_for_tx(tx):
+            for invoice_key in self.get_relevant_invoice_keys_for_tx(tx):
                 invoice = self.invoices.get(invoice_key)
                 if invoice is None: continue
                 assert isinstance(invoice, OnchainInvoice)
@@ -1249,7 +1252,9 @@ class Abstract_Wallet(AddressSynchronizer, ABC):
             tx = PartialTransaction.from_io(list(coins), list(outputs))
 
         # sender sort to make sure sender txi the first place
-        tx.sender_sort(sender)
+        op_sender = any([is_opsender_script(out.scriptpubkey)[0] for out in outputs])
+        if not op_sender and sender:
+            tx.legacy_sender_sort(sender)
         # Timelock tx to current height.
         tx.locktime = get_locktime_for_new_transaction(self.network)
 
@@ -1567,6 +1572,15 @@ class Abstract_Wallet(AddressSynchronizer, ABC):
         return tx
 
     def add_output_info(self, txout: PartialTxOutput, *, only_der_suffix: bool = True) -> None:
+        opsender_h160 = h160_from_opsender_script(txout.scriptpubkey)
+        if opsender_h160:
+            sender_addr = hash160_to_p2pkh(opsender_h160)
+            if self.is_mine(sender_addr):
+                pubkey_deriv_info = self.get_public_keys_with_deriv_info(sender_addr)
+                txout.opsender_pubkey = list(pubkey_deriv_info.keys())[0]
+                self._add_txinout_derivation_info(txout, sender_addr, only_der_suffix=only_der_suffix)
+            return
+
         address = txout.address
         if not self.is_mine(address):
             is_mine = self._learn_derivation_path_for_address_from_txinout(txout, address)
@@ -1578,6 +1592,7 @@ class Abstract_Wallet(AddressSynchronizer, ABC):
         if isinstance(self, Multisig_Wallet):
             txout.num_sig = self.m
         self._add_txinout_derivation_info(txout, address, only_der_suffix=only_der_suffix)
+
         if txout.redeem_script is None:
             try:
                 redeem_script_hex = self.get_redeem_script(address)
@@ -1827,7 +1842,7 @@ class Abstract_Wallet(AddressSynchronizer, ABC):
         #      note that they use incompatible "id"
         amount_sat = amount_sat or 0
         timestamp = int(time.time())
-        _id = bh2u(sha256d(address + "%d"%timestamp))[0:10]
+        _id = sha256d(address + "%d"%timestamp).hex()[0:10]
         expiration = expiration or 0
         return OnchainInvoice(
             type=PR_TYPE_ONCHAIN,
@@ -1849,7 +1864,7 @@ class Abstract_Wallet(AddressSynchronizer, ABC):
         paymentrequest.sign_request_with_alias(pr, alias, alias_privkey)
         req.bip70 = pr.raw.hex()
         req['name'] = pr.pki_data
-        req['sig'] = bh2u(pr.signature)
+        req['sig'] = pr.signature.hex()
         self.receive_requests[key] = req
 
     def add_payment_request(self, req: Invoice):
@@ -2102,7 +2117,7 @@ class Abstract_Wallet(AddressSynchronizer, ABC):
 
                         # check user bind address
                         __, hash160b = b58_address_to_hash160(bind_addr)
-                        hash160 = bh2u(hash160b).zfill(64)
+                        hash160 = hash160b.hex().zfill(64)
                         if hash160 not in topics:
                             self.logger.info("address mismatch")
                             continue
@@ -2320,7 +2335,7 @@ class Imported_Wallet(Simple_Wallet):
         if not self.db.has_imported_address(address):
             return
         if len(self.get_addresses()) <= 1:
-            raise Exception("cannot delete last remaining address from wallet")
+            raise UserFacingException("cannot delete last remaining address from wallet")
         transactions_to_remove = set()  # only referred to by this address
         transactions_new = set()  # txs that are not only referred to by address
         with self.lock:

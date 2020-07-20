@@ -29,7 +29,6 @@ import threading
 import os
 import traceback
 import json
-import shutil
 import weakref
 import csv
 from decimal import Decimal
@@ -42,7 +41,6 @@ from typing import Optional, TYPE_CHECKING, Sequence, List, Union
 import eth_abi
 
 from PyQt5.QtGui import QPixmap, QKeySequence, QIcon, QCursor, QFont
-from PyQt5.QtGui import QPixmap, QKeySequence, QIcon, QCursor, QFont
 from PyQt5.QtCore import Qt, QRect, QStringListModel, QSize, pyqtSignal
 from PyQt5.QtWidgets import (QMessageBox, QComboBox, QSystemTrayIcon, QTabWidget,
                              QMenuBar, QFileDialog, QCheckBox, QLabel,
@@ -53,17 +51,15 @@ from PyQt5.QtWidgets import (QMessageBox, QComboBox, QSystemTrayIcon, QTabWidget
                              QMenu, QAction)
 
 import electrum
-from electrum import (keystore, simple_config, ecc, constants, util, bitcoin, commands,
-                      coinchooser, paymentrequest)
 from electrum.bitcoin import COIN, is_address, TYPE_ADDRESS, b58_address_to_hash160, Token, opcodes, \
     TYPE_SCRIPT, is_hash160, hash_160, eth_abi_encode, Delegation, DELEGATE_ABI, DELEGATION_CONTRACT
-from electrum import (keystore, ecc, constants, util, bitcoin, commands,
+from electrum import (simple_config, keystore, ecc, constants, util, bitcoin, commands,
                       paymentrequest)
 from electrum.plugin import run_hook, BasePlugin
 from electrum.i18n import _
 from electrum.util import (format_time,
                            UserCancelled, profiler,
-                           bh2u, bfh, InvalidPassword,
+                           bfh, InvalidPassword,
                            UserFacingException,
                            get_new_wallet_name, send_exception_to_crash_reporter,
                            InvalidBitcoinURI, maybe_extract_bolt11_invoice, NotEnoughFunds,
@@ -1267,7 +1263,10 @@ class ElectrumWindow(QMainWindow, MessageBoxMixin, Logger):
             key = self.wallet.lnworker.add_request(amount, message, expiry)
         else:
             key = self.create_bitcoin_request(amount, message, expiry)
+            if not key:
+                return
             self.address_list.update()
+        assert key is not None
         self.request_list.update()
         self.request_list.select_key(key)
         # clear request fields
@@ -1279,20 +1278,23 @@ class ElectrumWindow(QMainWindow, MessageBoxMixin, Logger):
         title = _('Invoice') if is_lightning else _('Address')
         self.do_copy(content, title=title)
 
-    def create_bitcoin_request(self, amount, message, expiration):
+    def create_bitcoin_request(self, amount, message, expiration) -> Optional[str]:
         addr = self.wallet.get_unused_address()
         if addr is None:
-            if not self.wallet.is_deterministic():
+            if not self.wallet.is_deterministic():  # imported wallet
                 msg = [
-                    _('No more addresses in your wallet.'),
-                    _('You are using a non-deterministic wallet, which cannot create new addresses.'),
-                    _('If you want to create new addresses, use a deterministic wallet instead.')
+                    _('No more addresses in your wallet.'), ' ',
+                    _('You are using a non-deterministic wallet, which cannot create new addresses.'), ' ',
+                    _('If you want to create new addresses, use a deterministic wallet instead.'), '\n\n',
+                    _('Creating a new payment request will reuse one of your addresses and overwrite an existing request. Continue anyway?'),
                    ]
-                self.show_message(' '.join(msg))
-                return
-            if not self.question(_("Warning: The next address will not be recovered automatically if you restore your wallet from seed; you may need to add it manually.\n\nThis occurs because you have too many unused addresses in your wallet. To avoid this situation, use the existing addresses first.\n\nCreate anyway?")):
-                return
-            addr = self.wallet.create_new_address(False)
+                if not self.question(''.join(msg)):
+                    return
+                addr = self.wallet.get_receiving_address()
+            else:  # deterministic wallet
+                if not self.question(_("Warning: The next address will not be recovered automatically if you restore your wallet from seed; you may need to add it manually.\n\nThis occurs because you have too many unused addresses in your wallet. To avoid this situation, use the existing addresses first.\n\nCreate anyway?")):
+                    return
+                addr = self.wallet.create_new_address(False)
         req = self.wallet.make_payment_request(addr, amount, message, expiration)
         try:
             self.wallet.add_payment_request(req)
@@ -1671,10 +1673,6 @@ class ElectrumWindow(QMainWindow, MessageBoxMixin, Logger):
         if output_values.count('!') > 1:
             self.show_error(_("More than one output set to spend max"))
             return
-        if self.config.get('advanced_preview'):
-            self.preview_tx_dialog(make_tx=make_tx,
-                                   external_keypairs=external_keypairs)
-            return
 
         output_value = '!' if '!' in output_values else sum(output_values)
         d = ConfirmTxDialog(window=self, make_tx=make_tx, output_value=output_value, is_sweep=is_sweep)
@@ -1684,6 +1682,13 @@ class ElectrumWindow(QMainWindow, MessageBoxMixin, Logger):
             if not d.have_enough_funds_assuming_zero_fees():
                 self.show_message(_('Not Enough Funds'))
                 return
+
+        # shortcut to advanced preview (after "enough funds" check!)
+        if self.config.get('advanced_preview'):
+            self.preview_tx_dialog(make_tx=make_tx,
+                                   external_keypairs=external_keypairs)
+            return
+
         cancelled, is_send, password, tx = d.run()
         if cancelled:
             return
@@ -1895,7 +1900,7 @@ class ElectrumWindow(QMainWindow, MessageBoxMixin, Logger):
             lnaddr = lndecode(invoice, expected_hrp=constants.net.SEGWIT_HRP)
         except Exception as e:
             raise LnDecodeException(e) from e
-        pubkey = bh2u(lnaddr.pubkey.serialize())
+        pubkey = lnaddr.pubkey.serialize().hex()
         for k,v in lnaddr.tags:
             if k == 'd':
                 description = v
@@ -1998,8 +2003,13 @@ class ElectrumWindow(QMainWindow, MessageBoxMixin, Logger):
         return self.create_list_tab(l)
 
     def remove_address(self, addr):
-        if self.question(_("Do you want to remove {} from your wallet?").format(addr)):
+        if not self.question(_("Do you want to remove {} from your wallet?").format(addr)):
+            return
+        try:
             self.wallet.delete_address(addr)
+        except UserFacingException as e:
+            self.show_error(str(e))
+        else:
             self.need_update.set()  # history, addresses, coins
             self.clear_receive_tab()
 
@@ -3324,7 +3334,8 @@ class ElectrumWindow(QMainWindow, MessageBoxMixin, Logger):
     def do_token_pay(self, token: 'Token', pay_to, amount, gas_limit, gas_price, dialog, preview=False):
         try:
             datahex = 'a9059cbb{}{:064x}'.format(pay_to.zfill(64), amount)
-            script = contract_script(gas_limit, gas_price, datahex, token.contract_addr, opcodes.OP_CALL)
+            op_sender = token.bind_addr if self.network.get_server_height() > constants.net.QIP5_FORK_HEIGHT else None
+            script = contract_script(gas_limit, gas_price, datahex, token.contract_addr, opcodes.OP_CALL, op_sender)
             outputs = [PartialTxOutput(scriptpubkey=script, value=0)]
             tx_desc = _('Pay out {} {}').format(amount / (10 ** token.decimals), token.symbol)
             self._smart_contract_broadcast(outputs, tx_desc, gas_limit * gas_price,
@@ -3355,7 +3366,7 @@ class ElectrumWindow(QMainWindow, MessageBoxMixin, Logger):
         pod = self.wallet.sign_message(addr, staker, password)
         args = [staker.lower(), fee, pod]
         self.sendto_smart_contract(DELEGATION_CONTRACT, DELEGATE_ABI[1], args,
-                                   gas_limit, gas_price, 0, addr, dialog, False, password, tx_desc="add delegation")
+                                   gas_limit, gas_price, 0, addr, dialog, False, password, tx_desc="update delegation")
 
     def call_remove_delegation(self, addr, gas_limit, gas_price, dialog):
         if self.wallet.has_keystore_encryption():
@@ -3509,7 +3520,8 @@ class ElectrumWindow(QMainWindow, MessageBoxMixin, Logger):
     def sendto_smart_contract(self, address, abi, args, gas_limit, gas_price, amount, sender, dialog, preview, password=None, tx_desc=None):
         try:
             abi_encoded = eth_abi_encode(abi, args)
-            script = contract_script(gas_limit, gas_price, abi_encoded, address, opcodes.OP_CALL)
+            op_sender = sender if self.network.get_server_height() > constants.net.QIP5_FORK_HEIGHT else None
+            script = contract_script(gas_limit, gas_price, abi_encoded, address, opcodes.OP_CALL, op_sender)
             outputs = [PartialTxOutput(scriptpubkey=script, value=amount)]
             if tx_desc is None:
                 tx_desc = 'contract sendto {}'.format(self.wallet.db.smart_contracts.get(address, [address, ])[0])
@@ -3524,13 +3536,14 @@ class ElectrumWindow(QMainWindow, MessageBoxMixin, Logger):
             if is_opcreate_script(tx.outputs()[0].scriptpubkey):
                 reversed_txid = binascii.a2b_hex(tx.txid())[::-1]
                 output_index = b'\x00\x00\x00\x00'
-                contract_addr = bh2u(hash_160(reversed_txid + output_index))
+                contract_addr = hash_160(reversed_txid + output_index).hex()
                 self.set_smart_contract(name, contract_addr, abi)
         try:
             abi_encoded = ''
             if constructor:
                 abi_encoded = eth_abi_encode(constructor, args)
-            script = contract_script(gas_limit, gas_price, bytecode + abi_encoded, None, opcodes.OP_CREATE)
+            op_sender = sender if self.network.get_server_height() > constants.net.QIP5_FORK_HEIGHT else None
+            script = contract_script(gas_limit, gas_price, bytecode + abi_encoded, None, opcodes.OP_CREATE, op_sender)
             outputs = [PartialTxOutput(scriptpubkey=script, value=0)]
             self._smart_contract_broadcast(outputs, 'create contract {}'.format(name), gas_limit * gas_price,
                                            sender, dialog, broadcast_done, preview)
